@@ -1,0 +1,34 @@
+# FMS non-secret runtime configuration (Blueprint §7; tech spec §5.8 data
+# residency, §9.4 retention, §9.5-9.7 feature flags). Consumed by
+# api-deployment and worker-deployment via envFrom. Secrets (passwords, keys,
+# TLS) are deliberately absent - they live in secrets.yaml / KMS.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fms-config
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+immutable: false
+data:
+  APP_ENV: production
+  LOG_LEVEL: info
+  SYSTEM_TIMEZONE: UTC
+  BASE_CURRENCY: USD
+  SESSION_TIMEOUT: 30m
+  AUDIT_RETENTION_DAYS: "730"
+  FMS_MULTI_CURRENCY: "false"
+  FMS_AUDIT_READ_LOGGING: "false"
+  FMS_NOTIFICATIONS: "false"
+  FMS_BACKDATED_BUDGETS: "false"
+  S3_REGION: us-east-1
+  S3_ENDPOINT: https://s3.us-east-1.amazonaws.com
+  S3_BUCKET: fms-exports
+  EXPORT_PRESIGN_TTL: 15m
+  RATE_LIMIT_AUTH: "10"
+  RATE_LIMIT_GENERAL: "100"
+  RATE_LIMIT_EXPORT: "20"
+  DB_POOL_SIZE: "10"
+  DB_POOL_MAX_OVERFLOW: "20"
+  REPLICA_LAG_THRESHOLD: 30s

@@ -1,0 +1,203 @@
+# Redis 7 Deployment — sessions, rate limiting, and the hot-data cache (Blueprint §7;
+# tech spec §9.4 caching, §5.1 sessions, §7.2 rate limits).
+#
+# Role & integrity boundary
+#   Redis backs server-side 30-min inactivity sessions (`ses:`), sliding-window rate-limit
+#   counters (`rl:`), budget/category hot caches (`cache:`, TTL 60s / 5min), and the JWT
+#   revocation blacklist. It is NEVER the authoritative ledger (tech spec §6.3): the
+#   authoritative ledger is only ever read from Postgres. Writes always hit Postgres; reads
+#   fall back to the DB on a cache miss. Key namespaces are established by
+#   backend/internal/infrastructure/cache/redis.go. Because none of this state is
+#   authoritative, a standard Deployment with a single replica is correct; Redis loss
+#   degrades rate limiting and cache but never corrupts the ledger or balance invariants
+#   (`Account.balance == opening_balance + SUM(transactions)` lives only in Postgres with a
+#   conditional UPDATE under the use-case transaction).
+#
+# HIGH-AVAILABILITY OVERRIDE (default)
+#   A single replica is the baseline. For higher availability, replace this Deployment with a
+#   Redis replication/Sentinel topology or a managed Redis offering; that is an override note
+#   per the change description and is out of this file's scope.
+#
+# STATE-LOSS SEMANTICS (accepted, sign-off recommended)
+#   A Redis pod restart loses all in-memory sessions, rate-limit counters, and JWT-revocation
+#   entries. This is bounded and recoverable: users re-authenticate, the rate-limit window
+#   resets, and a formerly revoked access token could be accepted until its 15-min TTL
+#   (tech spec §9.1) expires. AOF (`--appendonly yes`) recovers coordination state on graceful
+#   restart on the redis-data PVC. `/health` must report Redis-down as DEGRADED rather than
+#   HEALTHY so operators see this in-memory-only revocation window, and the API must keep
+#   serving the cache-miss path (graceful degradation per §7.7).
+#
+# EVICTION POLICY (divergence from the 512mb/allkeys-lru spec)
+#   `maxmemory-policy volatile-lru` is used instead of `allkeys-lru` (security & architecture
+#   review P2): only keys with an explicit TTL are eligible for eviction. Every key written by
+#   redis.go carries a TTL, so this is functionally equivalent today while future-proofing
+#   against any non-expiring key stored in the same instance. This also bounds the JWT
+#   revocation blacklist and rate-limit counters — coordination state that must not be evicted
+#   by a rogue long-lived key.
+#
+# MEMORY SIZING (divergence from the localmax 512mb spec)
+#   `maxmemory 256mb` (reduced from 512mb) keeps AOF-rewrite fork headroom under the 512Mi
+#   container limit: BGREWRITEAOF forks and can double peak memory, so 512mb maxmemory within
+#   a 512Mi limit risks OOM-kill, which would defeat the graceful-degradation contract. Raise
+#   the memory limit (and maxmemory in step) if more cache capacity is required.
+#
+# CREDENTIALS & PROBES (CWE-522 / CWE-532)
+#   `--requirepass $(REDIS_PASSWORD)` is supplied from the fms-secrets env value and is
+#   expanded by Kubernetes in container `command` args; the value is therefore visible in the
+#   pod spec and /proc/Redis cmdline. This is accepted for a stateless coordination cache —
+#   a config-file/ACL-defined `requirepass` is a recommended security follow-up. Probes use
+#   the REDISCLI_AUTH env var (same secret value) and pass NO `-a $REDIS_PASSWORD` argument,
+#   so the password never appears in probe args or failure logs.
+#
+# NETWORK & TLS (documented accepted risk, CWE-319)
+#   This Deployment exposes nothing by itself. A ClusterIP Service (`redis`, port 6379) and a
+#   NetworkPolicy permitting ONLY the API pod selector on that port must accompany this
+#   workload (defined in a follow-up task). That strict network isolation is the compensating
+#   control for the absence of TLS on the Redis endpoint; do not ship both absent.
+#
+# SUPPLY CHAIN (K02 — mutable tag, accepted)
+#   `image: redis:7-alpine` is a mutable tag. The authoritative registry digest for this line
+#   must be resolved and CI-audited for CVEs (Redis 7.x Lua/permission advisories) before
+#   production release, then pinned here as `image: redis@sha256:<digest>`. `imagePullPolicy:
+#   IfNotPresent` avoids unwarranted re-pulls pending that audit.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fms-redis
+  namespace: fms
+  labels:
+    app: fms-redis
+    app.kubernetes.io/part-of: fms
+    app.kubernetes.io/name: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fms-redis
+  template:
+    metadata:
+      labels:
+        app: fms-redis
+        app.kubernetes.io/part-of: fms
+    spec:
+      securityContext:
+        # redis:7-alpine image runs as fixed uid 999; fsGroup lets the non-root process write
+        # AOF/RDB to the redis-data PVC (without it --appendonly yes fails at runtime).
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: redis-data
+          persistentVolumeClaim:
+            claimName: redis-data
+        - name: tmp
+          emptyDir: {}
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          env:
+            # Data-plane workload: discrete valueFrom.secretKeyRef keys, never envFrom on the
+            # full fms-secrets envelope (least privilege / fault isolation per secrets.yaml).
+            # K8s expands $(REDIS_PASSWORD) in command args from this env value.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fms-secrets
+                  key: REDIS_PASSWORD
+            # Consumer for redis-cli probes; keeps the password out of probe args and logs.
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: fms-secrets
+                  key: REDIS_PASSWORD
+          command:
+            - redis-server
+          args:
+            - --requirepass
+            - $(REDIS_PASSWORD)
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+            - --maxmemory
+            - 256mb
+            - --maxmemory-policy
+            - volatile-lru
+            - --maxmemory-clients
+            - "256"
+            - --maxclients
+            - "512"
+            - --dir
+            - /data
+          # No `-a $REDIS_PASSWORD` in exec args — the shell is bypassed in probe exec and the
+          # literal string would be passed as the password (auth failure => never Ready).
+          # REDISCLI_AUTH env supplies the credential instead; --no-auth-warning suppresses
+          # the stderr warning so the secret is not leaked into event/log output.
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - --no-auth-warning
+                - ping
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - --no-auth-warning
+                - ping
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+---
+# PVC backing AOF persistence at /data. 8Gi is generous headroom for a 256mb working set plus
+# AOF growth between rewrites and the ~2x working set a BGREWRITEAOF can momentarily require.
+# The underlying StorageClass must pin to the cluster's configured regional storage location
+# to honor data residency / sovereignty (tech spec §6.3, §9.3) and must keep `data` encrypted
+# at rest. AccessMode ReadWriteOnce matches the single-replica topology.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+    app.kubernetes.io/name: redis
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 8Gi

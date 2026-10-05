@@ -1,0 +1,66 @@
+# FMS namespace isolation foundation (Blueprint §7).
+# Apply this file first, before any other manifest under deploy/k8s/:
+#   kubectl apply -f deploy/k8s/namespace.yaml
+#
+# This provides workload/process isolation only. It does NOT provide tenant data
+# separation — cross-tenant isolation is enforced at the application and database
+# layers (row-level security + tenant-context propagation), never here.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fms
+  labels:
+    # Enforce the restricted Pod Security Standard on every workload in this namespace.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: fms-quota
+  namespace: fms
+spec:
+  hard:
+    pods: "200"
+    requests.cpu: "30"
+    requests.memory: "64Gi"
+    limits.cpu: "60"
+    limits.memory: "128Gi"
+    limits.ephemeral-storage: "50Gi"
+    requests.storage: "200Gi"
+    persistentvolumeclaims: "8"
+    count/services: "15"
+    count/configmaps: "30"
+    count/secrets: "20"
+    count/ingresses.networking.k8s.io: "3"
+    count/replicationcontrollers: "10"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: fms-limit
+  namespace: fms
+spec:
+  limits:
+    - type: Container
+      # Defaults apply only to pods that declare NO explicit resources. Stateful
+      # workloads (postgres/redis/rabbitmq) MUST set explicit requests/limits
+      # exceeding these defaults — e.g. postgres requests memory >= 16Gi — else the
+      # 256Mi default request risks OOM mid-transaction and breaches RPO/RTO.
+      defaultRequest:
+        cpu: 250m
+        memory: 256Mi
+      default:
+        cpu: "1"
+        memory: 1Gi
+      # Ceiling on the largest single container so no workload can claim the entire
+      # namespace quota and starve its peers.
+      max:
+        cpu: "8"
+        memory: 32Gi
+      # Bound request-to-limit overcommit for each container.
+      maxLimitRequestRatio:
+        cpu: "3"
+        memory: "3"

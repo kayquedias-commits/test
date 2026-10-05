@@ -1,0 +1,34 @@
+# fms-api ClusterIP Service — stable in-cluster endpoint for the versioned API.
+#
+# Backs api-ingress.yaml (routes `/v1` -> fms-api:80) and selects the pods from
+# api-deployment.yaml (`app: fms-api`). The Service is a thin, stateless L4
+# forwarder (tech spec §7.1 gateway owns auth/RBAC/rate-limit/correlation-ID —
+# this object carries no business logic). ClusterIP only: no external exposure;
+# all inbound traffic passes the TLS-terminating, rate-limited ingress, enforcing
+# the single choke point. Round-robin load balancing across ready replicas is the
+# basis of the 99.9% availability target (§5.5, §9.3). No sessionAffinity —
+# auth is stateless JWT, so sticky sessions are neither needed nor wanted.
+#
+# Out-of-scope sibling resources (not declared here):
+#   - default-deny NetworkPolicy — east-west network segmentation (§9.1), tracked
+#     as a sibling follow-up alongside api-deployment.yaml.
+#   - PDB / HPA — belong with the Deployment, not this object.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fms-api
+  namespace: fms
+  labels:
+    app: fms-api
+    app.kubernetes.io/part-of: fms
+    app.kubernetes.io/name: api
+spec:
+  selector:
+    app: fms-api
+  type: ClusterIP
+  ports:
+    - name: http
+      appProtocol: http
+      protocol: TCP
+      port: 80
+      targetPort: 8080

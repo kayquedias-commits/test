@@ -1,0 +1,55 @@
+# Build-context exclusions for the backend Docker image.
+# Context root is the repository root (docker build -f backend/Dockerfile .),
+# so patterns are anchored under backend/. Kept in sync with the root .gitignore.
+
+# General / dev artifacts (unanchored)
+*.tmp
+**/*.log
+.git/
+**/.DS_Store
+
+# Backend-anchored exclusions (repo-root context)
+backend/bin/
+backend/dist/
+backend/coverage/
+backend/*.test
+backend/*.out
+backend/tmp/
+backend/.env*
+
+# Secrets — never bake local credentials into image layers
+**/.env*
+.env
+.env.*
+**/.env.*
+!backend/.env.example
+**/.ssh/**
+**/.aws/**
+**/id_rsa*
+**/*.pem
+**/*.key
+**/.netrc
+**/credentials
+
+# Editor / shell-history artifacts
+**/.bash_history
+**/.zsh_history
+**/*.swp
+**/*.swo
+**/*~
+**/*.bak
+**/*.orig
+
+# Additional VCS metadata
+**/.svn/**
+**/.hg/**
+
+# Repo-root context trimming — backend image receives backend sources only
+frontend/node_modules/
+frontend/dist/
+deploy/
+
+# Negations must stay at the end — Docker does not re-traverse excluded directories.
+!backend/go.mod
+!backend/go.sum
+!backend/internal/**

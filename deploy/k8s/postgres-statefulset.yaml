@@ -1,0 +1,299 @@
+# FMS authoritative ledger — PostgreSQL 16 StatefulSet.
+#
+# Blueprint §7 / tech spec §10 persistence; §9.3 DR (WAL archiving for PITR,
+# RPO <= 15 min, RTO <= 1 h); §9.4 backups. PostgreSQL is the ACID system of
+# record (§7.4/§9.3); this manifest provisions the single authoritative primary.
+#
+# OPERATIONAL CAVEAT (availability): a single-primary, single-PVC topology does
+# NOT by itself meet the 99.9% uptime / RTO <= 1 h acceptance criteria — pod
+# recreation requires full WAL replay, and a non-replicated PVC is zone-bound.
+# This manifest is the valid self-managed / recovery path. Environments needing
+# the SLAs must run the documented override (managed PostgreSQL Multi-AZ, e.g.
+# RDS/Aurora, or a Patroni-deployed variant) using the same image.
+#
+# Migrations are applied by the migrations job / `make migrate`, never by this
+# StatefulSet — avoids boot-order races and enforces versioned migrations (§6.4).
+# Application-layer concerns (parameterized queries, RLS, connection pooling)
+# belong to the schema/app, not this manifest.
+#
+# External contracts (all on disk, no new imports):
+#   - deploy/k8s/secrets.yaml        -> fms-secrets keys POSTGRES_USER / POSTGRES_PASSWORD
+#   - deploy/k8s/configmap.yaml      -> fms-config key S3_REGION (non-secret)
+#   - scripts/backup.sh              -> consumes the WAL this StatefulSet archives
+#                                       (s3://fms-backups/wal/, SSE-KMS, IRSA)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: fms-postgres
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: fms-postgres
+  template:
+    metadata:
+      labels:
+        app: fms-postgres
+    spec:
+      terminationGracePeriodSeconds: 120
+      serviceAccountName: fms-postgres-sa
+      # Pre-provision fms-postgres-sa with an IAM role carrying least-privilege
+      # S3 permissions: s3:PutObject / s3:GetObject on arn:aws:s3:::fms-backups/*
+      # only — no s3:DeleteObject, no broad s3:*. Satisfies the pod-identity
+      # (IRSA) model so no credentials are embedded anywhere in this workload.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: topology.kubernetes.io/zone
+                labelSelector:
+                  matchLabels:
+                    app: fms-postgres
+      volumes:
+        # Shared TLS material + restrictive pg_hba.conf (written by init container).
+        - name: pg-conf
+          emptyDir: {}
+        # Writable runtime dirs for a read-only root filesystem. PostgreSQL needs
+        # writable /tmp and /var/run/postgresql; PGDATA root also stays writable.
+        - name: tmp
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+        # Bundled AWS CLI v2 binary staged by the awscli init container, used by
+        # archive_command. The postgres image has no `aws` CLI of its own.
+        - name: awscli
+          emptyDir: {}
+        # IRSA web-identity token projected from the bound service account. The
+        # AWS CLI authenticates via this token + AWS_ROLE_ARN — no access/secret
+        # keys ever enter the pod spec, ConfigMap, or manifest (security fix: no
+        # inlined credentials; networkpolicy.yaml still fence S3-only egress).
+        - name: aws-iam-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: sts.amazonaws.com
+                  expirationSeconds: 86400
+                  path: token
+      initContainers:
+        # Generates TLS server material if absent so `ssl=on` boots cleanly, and
+        # writes a hostssl-only pg_hba.conf so cleartext direct connections are
+        # rejected (security: encryption in transit for ALL direct DB paths —
+        # migrations job, backup/restore, app connection pool).
+        - name: tls-config-init
+          image: postgres:16.4
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              if [ ! -f /etc/postgresql/conf/server.crt ]; then
+                openssl req -x509 -newkey rsa:2048 -nodes \
+                  -keyout /etc/postgresql/conf/server.key \
+                  -out /etc/postgresql/conf/server.crt \
+                  -days 3650 -subj "/CN=fms-postgres"
+              fi
+              chown 999:999 /etc/postgresql/conf/server.key
+              chmod 0600 /etc/postgresql/conf/server.key
+              chmod 0644 /etc/postgresql/conf/server.crt
+              printf '%s\n' \
+                'local all all peer' \
+                'hostssl all all all scram-sha-256' > /etc/postgresql/conf/pg_hba.conf
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 999
+            runAsGroup: 999
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: pg-conf
+              mountPath: /etc/postgresql/conf
+        # Stages the bundled self-contained AWS CLI v2 into an emptyDir so the
+        # postgres container's archive_command can run it. The `2` major tag is
+        # guaranteed-published; operators may promote to a verified concrete 2.x
+        # patch (image tags are not verifiable via package-manifest tooling).
+        - name: awscli
+          image: amazon/aws-cli:2
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              mkdir -p /opt/aws/bin
+              cp /usr/local/bin/aws /opt/aws/bin/aws
+              chmod 0755 /opt/aws/bin/aws
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 999
+            runAsGroup: 999
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: awscli
+              mountPath: /opt/aws
+      containers:
+        - name: postgres
+          image: postgres:16.4
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          env:
+            # All secrets come from fms-secrets via discrete secretKeyRef entries
+            # (never envFrom, per secrets.yaml's least-privilege contract). Only
+            # non-sensitive values are set inline; the IRSA role ARN is a
+            # placeholder the operator fills — it is an IAM identity, not a secret.
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: fms-secrets
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fms-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              value: fms
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: fms-config
+                  key: S3_REGION
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: fms-config
+                  key: S3_REGION
+            - name: AWS_ROLE_ARN
+              value: arn:aws:iam::000000000000:role/fms-postgres-backup
+            - name: AWS_WEB_IDENTITY_TOKEN_FILE
+              value: /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+          # All postgres server parameters are driven via `-c` args: configmap.yaml
+          # (fms-config) carries only S3_* knobs and no postgres tuning keys, and
+          # postgres.conf lives inside the read-only image. Volume tuning knobs
+          # (shared_buffers, effective_cache_size, etc.) must land in configmap.yaml
+          # and be mounted here via the pg-conf volume; none are defined in scope.
+          command:
+            - postgres
+          args:
+            - -c
+            - ssl=on
+            - -c
+            - ssl_cert_file=/etc/postgresql/conf/server.crt
+            - -c
+            - ssl_key_file=/etc/postgresql/conf/server.key
+            - -c
+            - ssl_min_protocol_version=TLSv1.3
+            - -c
+            - password_encryption=scram-sha-256
+            - -c
+            - hba_file=/etc/postgresql/conf/pg_hba.conf
+            - -c
+            - wal_level=replica
+            - -c
+            - max_wal_senders=10
+            - -c
+            - archive_mode=on
+            # archive_timeout=300 forces a segment close and upload at least every
+            # 5 min under idle/low write volume, guaranteeing RPO <= 15 min even
+            # when a 16 MiB segment never fills under a light load.
+            - -c
+            - archive_timeout=300
+            # Fail-fast, non-blocking, NO internal retry/backoff: PostgreSQL owns
+            # WAL archiving retry, so the shell must exit non-zero on failure for
+            # pg_stat_archiver to see it and re-queue. %p is quoted to avoid shell
+            # word-splitting on the path. SSE-KMS encrypts every WAL object at
+            # rest in s3://fms-backups/wal/.
+            - -c
+            - archive_command=/opt/aws/bin/aws s3 cp "%p" s3://fms-backups/wal/ --sse aws:kms
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: pg-conf
+              mountPath: /etc/postgresql/conf
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: awscli
+              mountPath: /opt/aws
+            - name: aws-iam-token
+              mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 999
+            runAsGroup: 999
+            capabilities:
+              drop:
+                - ALL
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - $(POSTGRES_USER)
+                - -d
+                - $(POSTGRES_DB)
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Liveness uses a plain TCP handshake rather than pg_isready so a busy
+          # primary or a migration-triggered lock never trips a restart on the
+          # system of record (availability risk).
+          livenessProbe:
+            tcpSocket:
+              port: postgres
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 8Gi
+  # Volume at rest: annotation alone does NOT enable encryption — encryption is a
+  # property of the StorageClass. Reference fms-postgres-encrypted, whose
+  # provisioner must set encrypted: true + a kmsKeyId (AES-256/KMS). If that class
+  # is not provisioned in an environment, an operator may point to `standard` only
+  # where the provider enforces encryption; otherwise the PVC stalls or binding
+  # fails and the at-rest guarantee is lost.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: fms-postgres-encrypted
+        volumeMode: Filesystem
+        resources:
+          requests:
+            storage: 100Gi

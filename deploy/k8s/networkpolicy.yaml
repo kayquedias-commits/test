@@ -1,0 +1,366 @@
+# FMS namespace default-deny / explicit-allow NetworkPolicies (tech spec section 9.1).
+# Enforces least-privilege pod communication: financial data plane (DB, Redis, RabbitMQ)
+# is isolated from lateral movement, and no pod has general internet egress.
+#
+# Label contract (selectors below must match each workload manifest exactly):
+#   app: fms-api     -> deploy/k8s/api-deployment.yaml
+#   app: fms-worker  -> deploy/k8s/worker-deployment.yaml
+#   app: fms-postgres-> deploy/k8s/postgres-statefulset.yaml   (note: is "fms-postgres", NOT "fms-db")
+#   app: fms-redis   -> deploy/k8s/redis-deployment.yaml
+#   app: fms-rabbitmq-> deploy/k8s/rabbitmq-deployment.yaml
+#   app.kubernetes.io/component: backup -> deploy/k8s/postgres-backup-cronjob.yaml (CronJob sets no "app" label)
+#
+# <S3_IP_BLOCK>: resolve s3.us-east-1.amazonaws.com to the pinned region CIDR at provisioning time.
+# Keep it narrowed to the storage endpoint; NEVER use 0.0.0.0/0. Refresh whenever the provider
+# publishes new region ranges (versioned data contract, spec section 7.6). S3 egress is used by
+# api/worker (async export writes), the postgres pod (in-pod WAL archive_command to s3://fms-backups/wal/),
+# and the backup CronJob (aws s3 cp upload).
+#
+# <NODE_CIDR>: kubelet liveness/readiness/startup probes originate from node IPs, not pod IPs.
+# Confirm the CNI's probe-exemption behavior before narrowing: Cilium exempts kubelet probe traffic
+# by default; Calico does not and requires this ingress rule. Replace <NODE_CIDR> with the cluster
+# node/CNI subnet CIDR; this rule is required or api:8080 / worker:9090 / postgres:5432 pods never
+# reach Ready.
+#
+# Apply order: place allow rules first, then default-deny rules (or the same batch verified before
+# the denies) so no deny-window blocks api reaching the data plane during rollout.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fms-default-deny-ingress
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fms-default-deny-egress
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+---
+# Kubelet liveness/readiness/startup probes originate from node IPs (spec section 9.2 requires
+# such probes). Required so api:8080, worker:9090 and postgres:5432 pods can be marked Ready under
+# default-deny ingress. Narrow to api:8080/worker:9090/postgres:5432 once the CNI behavior is
+# confirmed against the deployed cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fms-allow-kubelet-probes
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: <NODE_CIDR>
+---
+# Ingress to the API from the ingress controller and the monitoring namespace only. Verify the
+# actual namespace names in the cluster and pin them exactly via kubernetes.io/metadata.name
+# (an empty/unpinned namespaceSelector would match all namespaces).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fms-allow-ingress-api
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+spec:
+  podSelector:
+    matchLabels:
+      app: fms-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Egress from the API to the data plane: Postgres (ledger), Redis (sessions/cache/rate-limit),
+# RabbitMQ (event bus; management port 15672 deliberately not allowed) and S3 (async export
+# uploads), plus DNS restricted to CoreDNS only (blocks DNS-tunneling exfiltration).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fms-allow-egress-api
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+spec:
+  podSelector:
+    matchLabels:
+      app: fms-api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: fms-postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app: fms-redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - podSelector:
+            matchLabels:
+              app: fms-rabbitmq
+      ports:
+        - protocol: TCP
+          port: 5672
+    - to:
+        - ipBlock:
+            cidr: <S3_IP_BLOCK>
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Egress from the worker: Postgres, RabbitMQ and S3, plus DNS. Redis is intentionally omitted:
+# the worker manifest references no Redis host (outbox relay and consumers use Postgres + AMQP),
+# so least-privilege egress excludes it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fms-allow-egress-worker
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+spec:
+  podSelector:
+    matchLabels:
+      app: fms-worker
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: fms-postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app: fms-rabbitmq
+      ports:
+        - protocol: TCP
+          port: 5672
+    - to:
+        - ipBlock:
+            cidr: <S3_IP_BLOCK>
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Ingress to Postgres from api, worker, and the backup CronJob only. The backup pod is matched by
+# its real label (app.kubernetes.io/component: backup) because the CronJob sets no "app" label.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fms-allow-ingress-postgres
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+spec:
+  podSelector:
+    matchLabels:
+      app: fms-postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fms-api
+        - podSelector:
+            matchLabels:
+              app: fms-worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: backup
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# Anti-exfiltration egress from Postgres: S3 only (in-pod WAL archive_command to the backup bucket)
+# plus DNS. No general internet egress from the DB pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fms-allow-egress-postgres
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+spec:
+  podSelector:
+    matchLabels:
+      app: fms-postgres
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: <S3_IP_BLOCK>
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Redis is reachable only from the API pod (the Redis deployment documents an API-pod-only client).
+# Redis must still run --requirepass and ideally TLS; this policy is a compensating network control,
+# not a substitute for application-layer authentication.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fms-allow-ingress-redis
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+spec:
+  podSelector:
+    matchLabels:
+      app: fms-redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fms-api
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+# RabbitMQ (AMQP 5672) reachable from api and worker only. Management (15672) and Prometheus (15692)
+# ports are intentionally blocked by default-deny; admin access is via kubectl port-forward, never a
+# network surface.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fms-allow-ingress-rabbitmq
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+spec:
+  podSelector:
+    matchLabels:
+      app: fms-rabbitmq
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fms-api
+        - podSelector:
+            matchLabels:
+              app: fms-worker
+      ports:
+        - protocol: TCP
+          port: 5672
+---
+# The backup CronJob pod connects to Postgres (pg_dump / pg_basebackup), uploads to S3 (aws s3 cp),
+# and resolves via DNS from inside its own pod. Required under default-deny, otherwise the job pod
+# is entirely network-isolated. Credentials come from fms-backup-secret (PGSSLMODE=verify-full).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fms-allow-egress-backup
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: backup
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: fms-postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - ipBlock:
+            cidr: <S3_IP_BLOCK>
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

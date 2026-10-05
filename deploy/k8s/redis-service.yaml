@@ -1,0 +1,42 @@
+# ClusterIP Service exposing Redis internally (Blueprint §7; tech spec §9.4 caching /
+# rate limiting / sessions, §6.3 "authoritative ledger never read from cache").
+#
+# THE STABLE ENDPOINT. Resolves REDIS_URL=redis://:$(REDIS_PASSWORD)@redis.fms.svc.cluster.local:6379/0
+# for the API and worker pods. DNS-name resolution decouples every internal consumer from pod
+# churn/reshuffling of the fms-redis Deployment; adapters must never hardcode pod IPs.
+#
+# SELECTOR BINDING. spec.selector.app=fms-redis must stay identical to the Deployment's pod
+# template labels (deploy/k8s/redis-deployment.yaml). Drift yields zero Endpoints, breaks
+# GET /health Redis reachability, and surfaces as DEPENDENCY_UNAVAILABLE (503) on
+# rate-limit/auth/session paths. port/targetPort 6379 matches the redis-server listener there.
+#
+# INTERNAL-ONLY + NETWORK ISOLATION (CWE-284). type: ClusterIP exposes no NodePort/LoadBalancer
+# and removes external exposure, but it does NOT itself restrict in-cluster cross-namespace
+# access. The NetworkPolicy in the fms namespace permitting ONLY the api/worker pod selectors on
+# port 6379 (a companion, separately shipped manifest) is the compensating control that makes
+# the "internal-only" claim hold; per redis-deployment.yaml: "do not ship both absent." TLS on
+# the Redis endpoint is a documented accepted risk (CWE-319) for this stateless coordination
+# cache, with the NetworkPolicy as the compensating control.
+#
+# NO SECRETS HERE (CWE-522). This manifest is password-agnostic: credentials stay in the
+# fms-secrets Secret and are consumed only by the Deployment. The Service routes (port-level)
+# but never authenticates.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: fms
+  labels:
+    app: fms-redis
+    app.kubernetes.io/part-of: fms
+    app.kubernetes.io/name: redis
+spec:
+  type: ClusterIP
+  selector:
+    app: fms-redis
+  ports:
+    - name: redis
+      protocol: TCP
+      port: 6379
+      targetPort: 6379

@@ -1,0 +1,133 @@
+# fms-frontend Deployment — stateless nginx SPA replicas behind the ingress.
+# Serves the React SPA built by frontend/Dockerfile. Stateless by construction;
+# the read-only root FS holds only the immutable dist/ payload, and all nginx
+# runtime writes (cache, pid, temp) land on the emptyDir mounts below.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fms-frontend
+  namespace: fms
+  labels:
+    app: fms-frontend
+    app.kubernetes.io/name: fms-frontend
+    app.kubernetes.io/part-of: fms
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fms-frontend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        # `app` matches the site's label convention used by networkpolicy selectors;
+        # `app.kubernetes.io/name` is the Deployment selector label per this spec.
+        app: fms-frontend
+        app.kubernetes.io/name: fms-frontend
+        app.kubernetes.io/part-of: fms
+    spec:
+      # Static origin makes no Kubernetes API calls — drop the default SA token mount.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+        # nginx (non-root, UID 101) binds privileged port 80 in nginx.conf; the
+        # Dockerfile documents this exact resolution for the non-root image.
+        # Keeping the hardened `drop: [ALL]` posture is preferable to granting the
+        # NET_BIND_SERVICE capability, so port binding is unblocked via this safe
+        # sysctl instead (no node allowlist required for Kubernetes safe sysctls).
+        sysctls:
+          - name: net.ipv4.ip_unprivileged_port_start
+            value: "0"
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        # nginx.conf omits a `pid` directive, so the master uses the compile-time
+        # default /var/run/nginx.pid — needs a writable mount under the read-only
+        # root FS alongside the cache/tmp scratch paths.
+        - name: run
+          emptyDir:
+            sizeLimit: 64Mi
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: fms-frontend
+                topologyKey: topology.kubernetes.io/zone
+      containers:
+        - name: frontend
+          # Unique tag pushed by CI after the image scan; never a mutable ':latest'
+          # so `imagePullPolicy: IfNotPresent` never serves a stale artifact.
+          image: <registry>/fms-frontend:<GITHUB_SHA>
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          env:
+            # Targeted injection only — NO blanket envFrom which would spill every
+            # (potentially future-secret) key of the shared configmap into a static
+            # SPA container. The key is absent from fms-config today, so it is
+            # optional.
+            - name: PUBLIC_API_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: fms-config
+                  key: PUBLIC_API_BASE_URL
+                  optional: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            # cpu request raised from 50m to 200m so request/limit ratio (2.5) is
+            # within the `fms` namespace LimitRange maxLimitRequestRatio of 3.
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/nginx
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /var/run

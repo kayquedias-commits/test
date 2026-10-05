@@ -1,0 +1,47 @@
+# PodDisruptionBudgets (PDBs) preserving API and worker quorum during voluntary
+# disruptions (node maintenance, rolling deploys) to uphold the 99.9% availability
+# target (Blueprint §7; tech spec §9.3, §5.9, §7.7).
+#
+# Selector contract: each spec.selector.matchLabels must byte-for-byte match the
+# pod-template labels in api-deployment.yaml (app: fms-api) and worker-deployment.yaml
+# (app: fms-worker). A label drift silently yields a PDB that selects zero pods (a
+# no-op), defeating the availability guarantee without error.
+#
+# Availability math: minAvailable is set at or below the corresponding HPA minimum so
+# autoscaling can always satisfy it. With the API at its HPA floor (2 replicas) and
+# minAvailable: 2, zero voluntary evictions are allowed — operators must scale the API
+# HPA above its floor before draining a node at low traffic. Quorum is preserved and
+# deliberately not weakened here.
+#
+# Scope: PDBs gate only voluntary evictions. Unplanned failures (crashes, OOM, liveness)
+# are outside this policy and are handled by the HPA and replica counts.
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fms-api-pdb
+  namespace: fms
+spec:
+  selector:
+    matchLabels:
+      app: fms-api
+  # Guarantee at least two API replicas remain available during voluntary disruptions.
+  minAvailable: 2
+  # Allow eviction of unhealthy pods even when the budget is exhausted so a hung pod
+  # can never block node drains or stall security remediation (requires K8s >= 1.27;
+  # on older clusters the default IfHealthyBudget applies).
+  unhealthyPodEvictionPolicy: AlwaysAllow
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fms-worker-pdb
+  namespace: fms
+spec:
+  selector:
+    matchLabels:
+      app: fms-worker
+  # Guarantee at least one event consumer remains running so async pipelines (audit
+  # append, read-model refresh, budget recompute, exports) keep processing.
+  minAvailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow

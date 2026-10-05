@@ -1,0 +1,265 @@
+@import "./tokens.css";
+
+@layer reset, base, utilities;
+
+:root {
+  color-scheme: light;
+}
+
+/* ---------------------------------- reset ---------------------------------- */
+
+@layer reset {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  body,
+  h1, h2, h3, h4, h5, h6,
+  p, figure {
+    margin: 0;
+  }
+
+  ul,
+  ol {
+    margin: 0;
+    padding-left: 0;
+    list-style: none;
+  }
+
+  img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+  }
+
+  a {
+    color: inherit;
+  }
+}
+
+/* ----------------------------------- base ---------------------------------- */
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: var(--font-sans, system-ui, -apple-system, "Segoe UI", sans-serif);
+    font-size: var(--text-base, 16px);
+    line-height: var(--leading-normal, 1.5);
+    color: var(--color-text, #1a2027);
+    background-color: var(--color-bg, #ffffff);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Visible focus — WCAG 2.4.7. The outline is never removed without a replacement. */
+  :focus-visible {
+    outline: 2px solid var(--focus-ring, #2563eb);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm, 4px);
+  }
+
+  /* Legacy fallback for browsers without :focus-visible support. */
+  @supports not (selector(:focus-visible)) {
+    :focus {
+      outline: 2px solid var(--focus-ring, #2563eb);
+      outline-offset: 2px;
+    }
+  }
+
+  /* Screen-reader-only content; the skip link becomes visible on focus. */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .sr-only:focus-visible {
+    position: fixed;
+    top: var(--space-2, 8px);
+    left: var(--space-2, 8px);
+    width: auto;
+    height: auto;
+    padding: var(--space-2, 8px) var(--space-4, 16px);
+    clip: auto;
+    white-space: normal;
+    background: var(--color-surface, #ffffff);
+    z-index: 1000;
+    box-shadow: var(--shadow-lg, 0 10px 15px -3px rgba(0, 0, 0, 0.1));
+  }
+
+  /* #root shell — sticky footer, CLS-safe dynamic viewport layout. */
+  #root {
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  #root > main {
+    flex: 1;
+  }
+
+  /* Heading scale — weight and size escalate together. */
+  h1 {
+    font-size: var(--text-4xl, 36px);
+    font-weight: var(--font-bold, 700);
+    line-height: var(--leading-tight, 1.25);
+  }
+
+  h2 {
+    font-size: var(--text-3xl, 30px);
+    font-weight: var(--font-semibold, 600);
+    line-height: var(--leading-tight, 1.25);
+  }
+
+  h3 {
+    font-size: var(--text-2xl, 24px);
+    font-weight: var(--font-semibold, 600);
+    line-height: var(--leading-tight, 1.25);
+  }
+
+  h4 {
+    font-size: var(--text-lg, 18px);
+    font-weight: var(--font-semibold, 600);
+    line-height: var(--leading-tight, 1.25);
+  }
+
+  /* 4px-grid flow spacing. */
+  p,
+  ul,
+  ol {
+    margin-bottom: var(--space-4, 16px);
+  }
+
+  li + li {
+    margin-top: var(--space-2, 8px);
+  }
+
+  /* Long-form content (reports, help, empty-state guidance) — 60–80ch. */
+  .prose {
+    max-width: 65ch;
+  }
+}
+
+/* -------------------------------- utilities -------------------------------- */
+
+@layer utilities {
+  .container {
+    width: 100%;
+    max-width: 1280px;
+    margin-inline: auto;
+    padding-inline: var(--space-4, 16px);
+  }
+
+  /* Common-region card — groups related data into one perceptual container. */
+  .card {
+    background: var(--color-surface, #ffffff);
+    border: 1px solid var(--color-border, #e2e8f0);
+    border-radius: var(--radius-lg, 12px);
+    padding: var(--space-6, 24px);
+    box-shadow: var(--shadow-sm, 0 1px 2px rgba(0, 0, 0, 0.05));
+  }
+
+  /* Shared geometry for status badges; gap reserves an icon slot (color is
+     never the only indicator of state). */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1, 4px);
+    font-size: var(--text-xs, 12px);
+    font-weight: var(--font-semibold, 600);
+    line-height: var(--leading-tight, 1.25);
+    padding: var(--space-1, 4px) var(--space-2, 8px);
+    border-radius: var(--radius-full, 9999px);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Ledger list defaults — semantic <table> per blueprint §8.3. */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  th,
+  td {
+    padding: var(--space-3, 12px) var(--space-4, 16px);
+    text-align: start;
+    font-size: var(--text-sm, 14px);
+    border-bottom: 1px solid var(--color-border, #e2e8f0);
+  }
+
+  th {
+    font-weight: var(--font-semibold, 600);
+    color: var(--color-text-secondary, #475569);
+    white-space: nowrap;
+  }
+
+  /* Monetary columns — tabular numerals prevent width shift as figures change. */
+  td[data-currency] {
+    font-variant-numeric: tabular-nums;
+    text-align: end;
+  }
+
+  /* ------------------------- breakpoints (mobile-first) ---------------------- */
+
+  @media (min-width: 768px) {
+    .container {
+      padding-inline: var(--space-6, 24px);
+    }
+
+    .grid-md-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: var(--space-6, 24px);
+    }
+
+    .grid-md-3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-6, 24px);
+    }
+  }
+
+  @media (min-width: 1024px) {
+    .container {
+      padding-inline: var(--space-8, 32px);
+    }
+
+    .grid-lg-3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-6, 24px);
+    }
+
+    .grid-lg-4 {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: var(--space-6, 24px);
+    }
+  }
+
+  /* Prefers-reduced-motion — zero only non-essential effects so focus rings
+     and loading/skeleton feedback remain perceivable. No !important: this block
+     sits after the base layer, so it wins within the file while unlayered
+     component styles can still override when needed. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms;
+      animation-iteration-count: 1;
+      transition-duration: 0.01ms;
+      scroll-behavior: auto;
+    }
+  }
+}

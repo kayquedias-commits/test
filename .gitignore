@@ -22,3 +22,36 @@
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
 replay_pid*
+
+# Go
+bin/
+vendor/
+*.test
+coverage.out
+
+# Node / Vite
+node_modules/
+dist/
+coverage/
+npm-debug.log*
+.vite/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local databases (dev/test artifacts)
+*.db
+*.sqlite3
+
+# Editor / OS
+*.swp
+.DS_Store
+.idea/
+.vscode/
+!.vscode/*.json
+
+# Docker
+*.tar
+.docker/

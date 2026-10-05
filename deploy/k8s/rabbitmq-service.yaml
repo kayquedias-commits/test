@@ -1,0 +1,36 @@
+# ClusterIP Service exposing the RabbitMQ broker (deploy/k8s/rabbitmq-deployment.yaml) to the
+# fms namespace. The stable FQDN rabbitmq.fms.svc.cluster.local:5672 is the AMQP endpoint used
+# by the outbox relay, event consumers, and export workers (referenced from AMQP_URL in
+# fms-secrets/config). Type ClusterIP keeps the broker cluster-internal: no NodePort or
+# LoadBalancer, no public exposure. External integrations (contested scope) route via the API
+# gateway, never through this Service.
+#
+# Security note: a NetworkPolicy must be applied alongside this Service to restrict ingress to
+# only the api and worker pod selectors (and the management port 15672 to monitoring scrapers).
+# That policy lives in its own artifact; until it is applied, the broker is exposed to the whole
+# namespace. This file contains no credentials — RABBITMQ_DEFAULT_USER/PASS are resolved from a
+# Kubernetes Secret in the deployment, never persisted here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: fms
+  labels:
+    app: fms-rabbitmq
+    app.kubernetes.io/part-of: fms
+    app.kubernetes.io/name: rabbitmq
+spec:
+  type: ClusterIP
+  # Must exactly match spec.selector.matchLabels.app and the pod template labels.app in
+  # rabbitmq-deployment.yaml (both fms-rabbitmq). Drift breaks DNS resolution/endpoints.
+  selector:
+    app: fms-rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: 5672
+      protocol: TCP
+    - name: mgmt
+      port: 15672
+      targetPort: 15672
+      protocol: TCP

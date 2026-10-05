@@ -1,0 +1,180 @@
+# Local-development orchestration for the FMS monorepo (Technical Spec §10).
+#
+# DEV-ONLY: the credentials below resolve from `.env` (or the `${VAR:-default}`
+# fallbacks here) and are for the local bridge network only. Never copy these
+# values into deploy/k8s/secrets.yaml or any production configuration. TLS is
+# terminated at the production ingress boundary; inside this compose the local
+# bridge network is isolated from the host loopback.
+#
+# Environment parity with production (Blueprint §3): the env contract below
+# matches backend/internal/config/config.go verbatim (all FMS_-prefixed keys)
+# and the build sections match the api/worker targets in backend/Dockerfile and
+# the ../frontend Dockerfile. Feature flags default all contested scope (§11) to
+# off so the core FMS functions with every external adapter disabled.
+version: "3.9"
+
+# Shared runtime contract for api/worker — mirrors config.go variable names.
+# Unset keys are left at the app's safe defaults (pool tuning, presign TTL,
+# trace ratio, max decimals, Argon2 params) rather than pinned here.
+x-fms-env: &fms-env
+  FMS_DB_URL: "postgres://fms:${POSTGRES_PASSWORD:-fms}@postgres:5432/fms"
+  FMS_REDIS_URL: "redis://:${REDIS_PASSWORD:-fms}@redis:6379/0"
+  FMS_AMQP_URL: "amqp://${RABBITMQ_DEFAULT_USER:-fms}:${RABBITMQ_DEFAULT_PASS:-fms}@rabbitmq:5672/"
+  FMS_S3_ENDPOINT: "http://minio:9000"
+  FMS_S3_REGION: "${S3_REGION:-us-east-1}"
+  FMS_S3_BUCKET: "${S3_BUCKET:-fms-exports}"
+  # Validate() requires a >=32-byte secret; this dev fallback is explicitly
+  # oriented to local runs and must be overridden in any shared/test env.
+  FMS_JWT_SECRET: "${FMS_JWT_SECRET:-dev-only-insecure-jwt-secret-change-me-0123456789abcdef}"
+  FMS_JWT_ISSUER: "${FMS_JWT_ISSUER:-fms-local}"
+  FMS_ACCESS_TOKEN_TTL: "15m"
+  FMS_REFRESH_TOKEN_TTL: "${FMS_REFRESH_TOKEN_TTL:-24h}"
+  FMS_SESSION_TIMEOUT: "${SESSION_TIMEOUT:-30m}"
+  # 730 days; Go time.ParseDuration has no 'd' unit, so 730*24h.
+  FMS_AUDIT_RETENTION: "${AUDIT_RETENTION:-17520h}"
+  FMS_SYSTEM_TIMEZONE: "${SYSTEM_TIMEZONE:-UTC}"
+  FMS_BASE_CURRENCY: "${BASE_CURRENCY:-USD}"
+  # Contested-scope feature flags (spec §11); strictly false by default.
+  FMS_MULTI_CURRENCY: "false"
+  FMS_AUDIT_READ_LOGGING: "false"
+  FMS_NOTIFICATIONS: "false"
+  FMS_BACKDATED_BUDGETS: "false"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fms
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-fms}"
+      POSTGRES_DB: fms
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fms || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: "${PG_MEM_LIMIT:-512m}"
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "$${REDIS_PASSWORD}"]
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-fms}"
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      # Password passed via REDISCLI_AUTH, not argv, so it is not visible in ps.
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: "${REDIS_MEM_LIMIT:-256m}"
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: "${RABBITMQ_DEFAULT_USER:-fms}"
+      RABBITMQ_DEFAULT_PASS: "${RABBITMQ_DEFAULT_PASS:-fms}"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: "${RABBITMQ_MEM_LIMIT:-512m}"
+
+  minio:
+    # Tagless placekeeper kept to the spec; pin to a verified immutable digest
+    # in CI so builds are reproducible (the registry checker here cannot
+    # resolve Docker Hub tags, so none is fabricated).
+    image: minio/minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      # Explicit root credentials so the image's default is never used (CWE-1188).
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-fmsminio}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-fmsminio}"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: "${MINIO_MEM_LIMIT:-512m}"
+
+  api:
+    build:
+      context: ./backend
+      target: api
+    environment:
+      <<: *fms-env
+      FMS_SERVICE_NAME: fms-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    mem_limit: "${API_MEM_LIMIT:-512m}"
+
+  worker:
+    build:
+      context: ./backend
+      target: worker
+    environment:
+      <<: *fms-env
+      FMS_SERVICE_NAME: fms-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    # Internal event/batch consumer (outbox relay, async exports, audit writes,
+    # period close). No host ports — never externally reachable (spec §7.1).
+    mem_limit: "${WORKER_MEM_LIMIT:-512m}"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: /v1
+    ports:
+      - "127.0.0.1:5173:80"
+    # The distroless api image has no shell/curl, so it cannot expose a container
+    # healthcheck; gate on start rather than health (spec mandates health-gating
+    # for every dependency that can host a check).
+    depends_on:
+      api:
+        condition: service_started
+    mem_limit: "${FRONTEND_MEM_LIMIT:-256m}"
+
+networks:
+  default:
+    name: fms-net
+
+volumes:
+  pg_data:
+  redis_data:
+  rabbitmq_data:
+  minio_data:
