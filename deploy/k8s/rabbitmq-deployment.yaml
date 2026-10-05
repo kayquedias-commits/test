@@ -1,0 +1,211 @@
+# RabbitMQ 3.13 durable broker Deployment — outbox-based async event backbone (Blueprint §7;
+# tech spec §7.4 async event backbone / outbox pattern, §7.5 export jobs, §9.2 queue-depth metrics).
+#
+# Role & integrity boundary
+#   This broker carries domain events relayed from the RDBMS via the outbox pattern
+#   (state + outbox row commit in the same ACID tx; a relay publishes to the queue), async
+#   export jobs, and scheduler coordination. Queue names (`fms.outbox`, `fms.events`,
+#   `fms.exports`, `fms.scheduler`) are the published contract between the broker and its
+#   consumers — they are standardized by backend/internal/infrastructure/events/relay.go and
+#   backend/internal/infrastructure/export/worker.go and MUST NOT be duplicated here as magic
+#   strings. At-least-once delivery requires `publisher confirms` (client-side in relay.go)
+#   plus consumer acks (`autoAck: false`) plus `durable=true` queues; idempotent consumers
+#   make replays of publish-confirmed messages safe. The broker holds NO dedup state — that is
+#   the consumer boundary. Queue depth is exposed via the Prometheus endpoint (port 15692) as a
+#   custom metric for the export worker's horizontal scaling.
+#
+# PERSISTENCE CONTRACT (no event loss)
+#   The PVC `rabbitmq-data` at /var/lib/rabbitmq persists durable queues. Without it an
+#   ACID-committed outbox row could be lost at the relay-publish boundary on restart. With
+#   publisher confirms, the relay only acks the outbox tx after the broker has flushed the
+#   message, bounding broker RPO to messages not yet flushed during unclean shutdown (retried
+#   from the outbox table on replay).
+#
+# HIGH-AVAILABILITY OVERRIDE (default)
+#   `replicas: 1` is the MVP baseline and is intentionally NOT a quorum/mirrored topology.
+#   RabbitMQ 3.13 quorum queues (the HA-native, default option) require a minimum of 3 nodes
+#   to function, and classic mirrored queues are equally multi-node. Both are therefore
+#   correct only as a documented production-strengthening note, not as this single-replica
+#   manifest. At 1 replica, persistent (`durable=true`) classic queues are the correct data
+#   structure; the broker is a SPOF for availability but NOT for durability (PVC retained, and
+#   the outbox table is the application-side source of truth for replay so no event is lost at
+#   the application boundary). Production promotion = quorum queues + StatefulSet with >=3
+#   replicas + headless discovery Service; out of this file's scope.
+#
+# CREDENTIALS & SECURITY POSTURE (CWE-798 / CWE-522 / CWE-306 / CWE-287)
+#   Broker credentials come only from `fms-secrets` via discrete valueFrom.secretKeyRef (the
+#   data-plane contract in secrets.yaml), never from envFrom on the full envelope and never as
+#   literals. Production values are injected by External Secrets Operator from KMS; no real
+#   credential may be committed. The image's default anonymous `guest` user must be disabled at
+#   the broker level (RABBITMQ_DEFAULT_USER being set does NOT disable guest) and anonymous /
+#   loopback-only access must be denied; the exact `guest`-hardening bootstrap is a follow-up
+#   because disabling it requires broker-side bootstrap tooling, not an env flag. The explicit
+#   non-default vhost below avoids relying on the default `/`. The `secretKeyRef` keys asserted
+#   here exist in fms-secrets; a typo causes CreateContainerConfigError at deployment.
+#
+# NETWORK & MANAGEMENT PLANE (CWE-668 / CWE-284 / CWE-319)
+#   This Deployment exposes nothing by itself. The Management UI (port 15672) and AMQP
+#   (port 5672) are cluster-internal only and MUST be accompanied by a ClusterIP Service plus a
+#   NetworkPolicy permitting ONLY the api and worker pod selectors on those ports (a follow-up
+#   task; do not ship the broker without it). "Cluster-internal" is documented intent — it must
+#   be enforced by that policy artifact. AMQP TLS on 5671 is optional hardening gated on the
+#   NetworkPolicy being enforced and the cluster network being trusted; if cross-namespace
+#   traffic is ever permitted, enable TLS (CWE-319) with cert-manager-managed certs and prefer
+#   client-cert (mTLS) broker<->consumer auth. The management UI requires auth by default and
+#   must never be a NodePort/LoadBalancer.
+#
+# POD SECURITY (CWE-732)
+#   securityContext: runAsNonRoot + runAsUser/Group/fsGroup 1000 + seccompProfile RuntimeDefault
+#   (namespace enforces PSS Restricted). `fsGroup: 1000` makes the rabbitmq-data PVC writable
+#   by the non-root process; a runAs/fsGroup mismatch is the most common crash-loop cause on
+#   startup (data-dir permission error). `readOnlyRootFilesystem: true` with an emptyDir at
+#   /tmp and a writable /var/lib (PVC) covers the image's runtime write paths, and
+#   `capabilities: drop: [ALL]` removes everything the broker does not need.
+#
+# PROBES
+#   probes use the canonical `rabbitmq-diagnostics -q ping` (exercises the Erlang VM, not just
+#   the TCP socket) and pass no secrets in args. NOTE (follow-up): a bare `ping` only proves the
+#   VM responds — it passes on a jammed broker. Progression to `check_running` +
+#   check_port_connectivity, plus a queue-depth watchdog/alert on the exported metric, is a
+#   documented hardening follow-up so a stuck consumer is visible via the exported gauge.
+#
+# DLX / BACKLOG BOUNDING (CWE-400, accepted-follow-up)
+#   With at-least-once semantics a poison message in fms.events causes infinite redelivery and
+#   can stall budget-actuals / read-model refresh; an unacked backlog can exhaust the 10Gi PVC.
+#   Queue policies `x-dead-letter-exchange` (DLX -> fms.dlq) + `x-message-ttl` / `max-length` /
+#   max-length-bytes must be declared broker-side (relay.go or a rabbitmq.conf policy) — a
+#   documented follow-up, not shipped here because the queue declarations live in the
+#   producer/consumer code.
+#
+# SUPPLY CHAIN (K02 / A06 / CWE-1104 — mutable tag, accepted)
+#   `image: rabbitmq:3.13-management-alpine` is a mutable tag including the management + prometheus
+#   plugins. The authoritative registry digest for this line and the management plugin must be
+#   resolved and CI-audited for CVEs (RabbitMQ/Erlang advisories) before production release, then
+#   pinned here as `image: rabbitmq@sha256:<digest>`. `imagePullPolicy: IfNotPresent` avoids
+#   unwarranted re-pulls pending that audit.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fms-rabbitmq
+  namespace: fms
+  labels:
+    app: fms-rabbitmq
+    app.kubernetes.io/part-of: fms
+    app.kubernetes.io/name: rabbitmq
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fms-rabbitmq
+  template:
+    metadata:
+      labels:
+        app: fms-rabbitmq
+        app.kubernetes.io/part-of: fms
+    spec:
+      securityContext:
+        # Official rabbitmq alpine image runs as fixed uid 999 for the `rabbitmq` user; fsGroup
+        # lets the non-root process write durable queues to the rabbitmq-data /var/lib Mnesia dir.
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: rabbitmq-data
+          persistentVolumeClaim:
+            claimName: rabbitmq-data
+        - name: tmp
+          emptyDir: {}
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3.13-management-alpine
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          env:
+            # Data-plane workload: discrete valueFrom.secretKeyRef keys, never envFrom on the
+            # full fms-secrets envelope (least privilege / fault isolation per secrets.yaml).
+            - name: RABBITMQ_DEFAULT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: fms-secrets
+                  key: RABBITMQ_DEFAULT_USER
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: fms-secrets
+                  key: RABBITMQ_DEFAULT_PASS
+            # Explicit non-default vhost avoids relying on the default `/` (hardening per
+            # security review; not a secret).
+            - name: RABBITMQ_DEFAULT_VHOST
+              value: EventBus
+          # The `-management` image variant ships the management + prometheus plugins enabled.
+          # No credentials are passed via command/args (keeps the secret out of the pod spec
+          # cmdline and logs, CWE-532).
+          livenessProbe:
+            exec:
+              command:
+                - rabbitmq-diagnostics
+                - -q
+                - ping
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - rabbitmq-diagnostics
+                - -q
+                - ping
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          volumeMounts:
+            - name: rabbitmq-data
+              mountPath: /var/lib/rabbitmq
+            - name: tmp
+              mountPath: /tmp
+---
+# PVC backing durable queue persistence at /var/lib/rabbitmq. 10Gi provides headroom for the
+# outbox/events/exports/scheduler backlog at the tech spec §6.3 scale (100k transactions,
+# small JSON event envelopes with IDs and before/after deltas; export jobs reference object-store
+# keys, not raw payloads). The underlying StorageClass must pin to the cluster's configured
+# regional storage location to honor data residency / sovereignty (tech spec §6.3, §9.3) and must
+# keep `data` encrypted at rest. AccessMode ReadWriteOnce matches the single-replica topology.
+# The StorageClass should default to (or explicitly set) a `Retain` reclaim policy to prevent
+# accidental PVC deletion from destroying broker data.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rabbitmq-data
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+    app.kubernetes.io/name: rabbitmq
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi

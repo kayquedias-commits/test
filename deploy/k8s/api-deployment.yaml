@@ -1,0 +1,140 @@
+# fms-api Deployment — stateless API replicas behind api-service/api-ingress.
+#
+# Serves all /v1/* routes and /health. Stateless by construction: session state
+# lives in Redis (tech spec §9.4), never in pod-local memory, so any pod can
+# handle any request. The 99.9% availability target (§9.3, §10) rests on
+# replicas >= 2 with multi-AZ anti-affinity, dependency-gated readiness, and a
+# graceful SIGTERM drain (§6).
+#
+# The image tag is pinned by CI after image scan/signing (never 'latest';
+# SHA-digest tag replaces <digest>). Secrets are delivered via envFrom from
+# fms-secrets, and runtime config from fms-config, per the consumer contract in
+# secrets.yaml — API never calls the Kubernetes API (automountServiceAccountToken
+# false).
+#
+# Out-of-scope sibling resources (deployment-slice follow-ups, not declared here):
+#   - PodDisruptionBudget (minAvailable: 2) — bounds voluntary disruption.
+#   - HorizontalPodAutoscaler — horizontal scale-out path (§5.4).
+#   - default-deny NetworkPolicy — east-west network segmentation (§9.1).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fms-api
+  namespace: fms
+  labels:
+    app: fms-api
+    app.kubernetes.io/part-of: fms
+    app.kubernetes.io/name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: fms-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: fms-api
+        app.kubernetes.io/part-of: fms
+    spec:
+      # API never talks to the Kubernetes API — drop the default SA token mount.
+      automountServiceAccountToken: false
+      # SIGTERM drain of in-flight requests before SIGKILL (tech spec §6).
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+      volumes:
+        # Writable scratch space for the distroless/non-root runtime under a
+        # read-only root FS (Dockerfile comment: mounted as a k8s emptyDir at
+        # deploy time). medium: Memory keeps writes off the host disk.
+        - name: tmp
+          emptyDir:
+            medium: Memory
+      containers:
+        - name: api
+          # Pin by SHA digest after CI image scan + cosign signature. <digest> is
+          # substituted by CI — never a mutable ':latest' tag.
+          image: <registry>/fms-api@sha256:<digest>
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: fms-config
+            - secretRef:
+                name: fms-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          # Startup gates liveness during cold-start dependency connect.
+          startupProbe:
+            httpGet:
+              path: /health/startup
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+            successThreshold: 1
+          # Process liveness only — MUST NOT check DB/Redis (a dependency blip
+          # must not cause restart loops; readiness gates traffic instead).
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+          # Gates LB traffic on dependency reachability (DB, Redis, queue).
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: fms-api
+              topologyKey: topology.kubernetes.io/zone
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: fms-api

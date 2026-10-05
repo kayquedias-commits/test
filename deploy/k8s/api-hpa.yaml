@@ -1,0 +1,63 @@
+# fms-api HorizontalPodAutoscaler — stateless horizontal scale-out (§5.4, §9.3).
+#
+# Scales the stateless fms-api Deployment on real load. Pods hold no state
+# (sessions/rate-limit in Redis, ledger in Postgres), so horizontal replication
+# is safe and read/write separation keeps interactive queries sub-second while
+# replicas grow. Pairs with pdb.yaml: the HPA minReplicas enforces the floor on
+# desired replicas; the PDB minAvailable independently constrains voluntary
+# eviction during drains/deploys — two separate guards. The target Deployment
+# already declares resources.requests (cpu 250m / memory 256Mi) and per-pod
+# limits, so the averageUtilization targets below are actionable and per-pod
+# consumption is bounded; namespace ResourceQuota caps total scale-out.
+#
+# HARD SCALING BOUND (operational prerequisite, not enforced by this file):
+# maxReplicas (10) x per-replica Postgres pool (pool_size 10 + max_overflow 20)
+# => up to 300 dB connections to a ledger whose max_connections default is
+# ~100-150. Before raising maxReplicas, confirm Postgres max_connections
+# headroom (or front the ledger with a connection pooler); otherwise scale-out
+# yields DEPENDENCY_UNAVAILABLE (503), not availability. Pool-cap tuning belongs
+# to the api-deployment.yaml/DB task, not here.
+#
+# TODO(future): wire fms_api_request_latency_p95 as a Prometheus external metric
+# (prometheus-adapter) at Value 500ms when read volume justifies it — aligns
+# scaling with the query-latency SLO (tech spec §9.4), keeping CPU/memory as
+# secondary guards. Never the sole metric, since a latency spike is also an
+# attack symptom.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fms-api-hpa
+  namespace: fms
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fms-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60

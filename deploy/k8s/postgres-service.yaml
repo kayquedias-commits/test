@@ -1,0 +1,22 @@
+# FMS PostgreSQL headless Service — gives the API, worker, and backup CronJob a stable
+# DNS identity for PostgreSQL independent of pod recreation. Matches the StatefulSet
+# serviceName to provide per-pod DNS (postgres-0.postgres-headless.fms.svc.cluster.local)
+# for ordered startup and deterministic primary targeting by the PITR restore script.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: fms-postgres
+  type: ClusterIP
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP

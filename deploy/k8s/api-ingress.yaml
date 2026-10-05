@@ -1,0 +1,86 @@
+# Public ingress for the FMS web application — single entry point (tech spec §7.1).
+#
+# Serves the SPA and the versioned API from ONE origin:
+#   - `/`   → fms-frontend (ClusterIP Service, port 80) — SPA index + client-side
+#             deep-link fallback via frontend/nginx.conf (try_files ... index.html).
+#   - `/v1` → fms-api (ClusterIP Service, port 80) — versioned REST API (tech spec §7.2).
+#
+# The ingress controller matches longest-prefix first, so `/v1/*` always reaches
+# fms-api before the `/` catch-all is evaluated. Using pathType: Prefix for `/` is
+# deliberate: Exact would 404 deep SPA routes at the ingress (correctness §8.4).
+#
+# TLS terminates here via a single cert-manager ClusterIssuer certificate
+# (secret `fms-tls-cert`); secrets.yaml stores NO TLS material — trust domains are
+# separated (cert-manager owns issuance). HSTS is set server-level so both `/` and
+# `/v1` inherit it. CORS is an explicit origin allowlist (no wildcard — tech spec
+# §9.1); no cors-allow-credentials is set, so credential-bearing headers are never
+# emitted.
+#
+# RATE LIMITING: applied at the API service boundary, not the ingress. configmap.yaml
+# defines RATE_LIMIT_AUTH/GENERAL/EXPORT (Redis-backed sliding window, tech spec §7.2)
+# enforced by the api middleware chain (httpserver/router.go). No server-level nginx
+# limit-rps/limit-burst annotation is set here: nginx ingress applies those at the
+# server/location scope and would unintentionally throttle the `/` static path,
+# breaking the FCP <= 1.8s / TTFB <= 800ms budget. `/` is therefore delivered
+# unthrottled while all data-bearing `/v1` endpoints remain rate-limited by the API.
+#
+# NOTE: host `app.example.org` and issuer `letsencrypt-prod` are placeholders — set to
+# the deployed production host and the cluster's configured cert-manager ClusterIssuer.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: fms-api-ingress
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+    app.kubernetes.io/managed-by: kustomize/gitops
+  annotations:
+    # cert-manager provisions the certificate from the ClusterIssuer below.
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Redirect HTTP -> HTTPS at the ingress; legacy HTTP never reaches a backend.
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Server-level HSTS so BOTH `/` and `/v1` responses carry Strict-Transport-Security.
+    nginx.ingress.kubernetes.io/hsts: "true"
+    # Explicit origin allowlist for cross-origin API clients — no wildcard, no credentials.
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.example.org"
+    nginx.ingress.kubernetes.io/cors-allow-credentials: "false"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PATCH, PUT, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "DNT, X-CustomHeader, Keep-Alive, User-Agent,
+      X-Requested-With, If-Modified-Since, Cache-Control, Content-Type, Authorization,
+      Idempotency-Key"
+    # Proxy timeouts to avoid EOF on long API responses / async job poll.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+spec:
+  ingressClassName: nginx
+  tls:
+    # Single cert-manager-managed certificate terminating TLS for BOTH the SPA and
+    # the API on the same host — one trust domain, no per-path certificate drift.
+    - secretName: fms-tls-cert
+      hosts:
+        - app.example.org
+  rules:
+    - host: app.example.org
+      http:
+        paths:
+          # Versioned API — preserved unchanged; longest-prefix match wins over `/`.
+          # All data-bearing endpoints live under /v1 behind the API middleware chain.
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: fms-api
+                port:
+                  number: 80
+          # SPA catch-all — serves index.html and handles client-side deep links
+          # through frontend/nginx.conf SPA fallback.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: fms-frontend
+                port:
+                  number: 80

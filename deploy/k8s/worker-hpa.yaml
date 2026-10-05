@@ -1,0 +1,58 @@
+# HorizontalPodAutoscaler scaling the fms-worker consumer fleet on RabbitMQ queue depth.
+#
+# Blueprint §7; tech spec §7.4 (async backlog control / outbox relay + projection
+# consumers), §7.5 (export jobs + scheduler), §7.7 (bulkhead + graceful degradation).
+#
+# Scales workers on consumer backlog, not API load, so a large export or batch closure
+# enqueues messages without stalling event processing (read/write separation §3.5,
+# bulkhead §7.7). The worker Deployment is stateless and consumes at-least-once with
+# checkpoint dedup (tech spec §7.4), which makes up/down scaling here safe.
+#
+# Metric source chain (must stay aligned or scaling is disabled):
+#   relay.go queue names (fms.outbox, fms.events, fms.exports, fms.scheduler)
+#   -> rabbitmq-deployment.yaml Prometheus endpoint (port 15692)
+#   -> Prometheus Adapter external metric rabbitmq_queue_depth (aggregated over fms.*)
+#   -> this external metric reference below.
+#
+# This manifest carries no secrets; metric authenticity, the per-pod resource ceiling,
+# and HPA write RBAC are enforced in adjacent manifests/config (tracked as follow-ups).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fms-worker-hpa
+  namespace: fms
+  labels:
+    app: fms-worker
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/part-of: fms
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fms-worker # must match metadata.name of worker-deployment.yaml exactly
+  minReplicas: 2 # data-safety floor: the checkpointed outbox relay must never scale to 0
+  maxReplicas: 8 # bounded by namespace quota; 8 x per-pod request stays within the DB pool headroom
+  metrics:
+    # Primary signal: fleet queue depth is a shared broker series, so an External metric
+    # is required (not Pods/Object). AverageValue targets per-replica backlog; queue
+    # length / replica count == the worker drain rate, calibrated to the export batch size.
+    - type: External
+      external:
+        metric:
+          name: rabbitmq_queue_depth
+        target:
+          type: AverageValue
+          averageValue: "50"
+    # Graceful fallback if the adapter metric path is temporarily unavailable: scale on
+    # pod CPU rather than stall the fleet. References the worker's existing cpu request.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Bursty queues (1,000-row export batches, period-close outbox floods) would shed
+      # consumers mid-drain and delay read-model refresh; hold 5 minutes to prevent flapping.
+      stabilizationWindowSeconds: 300

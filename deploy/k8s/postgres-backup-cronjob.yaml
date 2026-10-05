@@ -1,0 +1,125 @@
+# Daily full PostgreSQL snapshot (Blueprint §7; tech spec §9.3).
+# Continuous WAL archiving on postgres-statefulset bounds RPO <= 15 min; this
+# daily full + WAL replay in scripts/restore.sh bounds RTO <= 1 h.
+# Executes scripts/backup.sh (mounted read-only) on a least-privilege pod.
+# This job is a data-plane consumer of the fms-secrets contract (deploy/k8s/secrets.yaml):
+# it reads secrets via discrete secretKeyRef with no envFrom, so a config-plane
+# capability leak cannot exfiltrate the whole envelope (OWASP K8s K08; CWE-522).
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fms-postgres-backup
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+    app.kubernetes.io/component: backup
+spec:
+  schedule: "0 1 * * *"          # UTC daily full in the low-activity window
+  concurrencyPolicy: Forbid       # never overlap fulls (double pg_dump on primary)
+  startingDeadlineSeconds: 300    # surface a missed window instead of silent drift
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 1800 # hard cap on a hung pg_dump/S3 run
+      backoffLimit: 3             # transient-failure retry budget (tech spec §7.7)
+      ttlSecondsAfterFinished: 86400 # prune completed Job objects only; S3 objects are governed by backup.sh/S3 lifecycle
+      template:
+        metadata:
+          labels:
+            job-name: fms-postgres-backup
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: OnFailure
+          # Dedicated least-privilege SA (prerequisite manifest outside this file).
+          # backup.sh performs no k8s API calls, so the service-account token is never mounted.
+          serviceAccountName: fms-backup-sa
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999          # postgres image default UID
+            fsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault  # required by the fms namespace restricted PSA
+          containers:
+            - name: backup
+              image: postgres:16
+              command: ["bash", "/scripts/backup.sh"]
+              securityContext:
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true     # writable dump staging lives on /backup emptyDir
+                capabilities:
+                  drop: ["ALL"]
+              env:
+                # S3 + DB credentials come only from fms-secrets via discrete keyRef.
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: fms-secrets
+                      key: S3_ACCESS_KEY
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: fms-secrets
+                      key: S3_SECRET_KEY
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: fms-secrets
+                      key: DATABASE_URL
+                # Alerting stays disabled until these keys are provisioned (optional).
+                - name: ALERT_WEBHOOK
+                  valueFrom:
+                    secretKeyRef:
+                      name: fms-secrets
+                      key: ALERT_WEBHOOK
+                      optional: true
+                - name: ALERT_WEBHOOK_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: fms-secrets
+                      key: ALERT_WEBHOOK_TOKEN
+                      optional: true
+                - name: S3_REGION
+                  valueFrom:
+                    configMapKeyRef:
+                      name: fms-config
+                      key: S3_REGION
+                # Override: fms-config's S3_BUCKET is the fms-exports bucket, not backup.
+                - name: S3_BUCKET
+                  value: fms-backups
+                - name: BACKUP_ROOT
+                  value: /backup       # scripts/backup.sh requires this path
+                - name: BACKUP_PREFIX
+                  value: fms-backups
+                - name: ARCHIVE_PREFIX
+                  value: fms-archive
+                - name: RETENTION_DAYS
+                  value: "30"
+                - name: S3_UPLOAD_ATTEMPTS
+                  value: "3"
+                - name: DUMP_TIMEOUT_SEC
+                  value: "1800"
+                - name: PGSSLMODE
+                  value: verify-full    # DB connections require TLS and cert verification
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 1Gi
+              volumeMounts:
+                - name: backup-script
+                  mountPath: /scripts
+                  readOnly: true
+                - name: backup-root
+                  mountPath: /backup
+          volumes:
+            # Read-only mount of the script content (backup.sh from scripts/backup.sh).
+            - name: backup-script
+              configMap:
+                name: fms-backup-script
+                defaultMode: 0550
+            - name: backup-root
+              emptyDir:
+                sizeLimit: 1Gi   # bound dump staging so it cannot exhaust cluster ephemeral storage

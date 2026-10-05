@@ -1,0 +1,145 @@
+# Background worker Deployment — isolates async work from the request path.
+#
+# Blueprint §7; tech spec §7.4 (outbox relay + projection consumers), §7.5 (scheduler /
+# leader election), §7.7 (bulkhead + graceful shutdown).
+#
+# Runs the outbox relay, projection consumers, export worker pool, and scheduler as a
+# separate Deployment so heavy exports and batch closures can never degrade interactive
+# query latency (bulkhead pattern, tech spec §7.7). The process is built from the
+# `backend/Dockerfile` target `worker` (distroless static, non-root UID 65532).
+#
+# Security posture: hardened container + pod securityContext (non-root UID 65532,
+# read-only root filesystem, drop-all caps, RuntimeDefault seccomp) aligned with the
+# namespace's enforced Pod Security Standard `restricted`. The metrics/health listener is
+# the worker's only network surface and must NOT be published via a Service/Ingress.
+#
+# Deployment-time notes (out of scope for this manifest — tracked as follow-ups):
+#   - NetworkPolicy: the worker is outbound-only (egress deny-by-default allowing only
+#     Postgres, Redis, RabbitMQ, object storage, and kube-dns; ingress null). Add a
+#     separate NetworkPolicy selecting `app: fms-worker`.
+#   - Image tag: resolve `<registry>/fms-worker:<VERSION>` to a CI-generated immutable
+#     digest and audit the image's third-party dependencies for high/critical CVEs before
+#     release (supply-chain gate, tech spec §9.1).
+#   - Secret scoping: envFrom consumes the full `fms-secrets` envelope because
+#     `backend/cmd/worker/main.go` (config.Load) reads the complete key set from the
+#     environment (DB, Redis, AMQP, S3, plus the JWT signing key). Once config is
+#     refactored, prefer discrete secretKeyRef entries / a worker-scoped Secret.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fms-worker
+  namespace: fms
+  labels:
+    app: fms-worker
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/part-of: fms
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: fms-worker
+  template:
+    metadata:
+      labels:
+        app: fms-worker
+        app.kubernetes.io/name: worker
+        app.kubernetes.io/part-of: fms
+    spec:
+      # Worker replicas are stateless except for in-flight jobs; killed pods re-queue their
+      # job (at-least-once delivery) and the replacement consumer applies it idempotently.
+      # Scheduler leader election uses the Redis/DB distributed lock owned by the worker
+      # process, not the Kubernetes Lease API, so no service-account token / K8s API
+      # access is required.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread the two replicas so a single zone failure cannot take down the entire
+      # async path (99.9% availability target). maxSkew: 1 keeps distribution even.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: fms-worker
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: topology.kubernetes.io/zone
+                labelSelector:
+                  matchLabels:
+                    app: fms-worker
+      terminationGracePeriodSeconds: 60
+      # Writable scratch volume for the read-only root filesystem: export staging and /tmp.
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      containers:
+        - name: worker
+          image: <registry>/fms-worker:<VERSION> # CI-tagged; pin to an immutable digest before release
+          imagePullPolicy: IfNotPresent
+          # Worker-scoped cfg comes from the shared ConfigMap; runtime secrets come from the
+          # Secret envelope (see Deployment-time notes above on post-refactor scoping).
+          envFrom:
+            - configMapRef:
+                name: fms-config
+            - secretRef:
+                name: fms-secrets
+          env:
+            # Bulkhead + outbox/scheduler knobs.
+            - name: EXPORT_WORKER_CONCURRENCY
+              value: "4"
+            # Tech spec §7.7: retry up to 5 times, then mark the export job FAILED.
+            - name: EXPORT_RETRY_MAX
+              value: "5"
+            - name: OUTBOX_POLL_INTERVAL_MS
+              value: "200"
+            - name: PROJECTION_BATCH_SIZE
+              value: "1000"
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          livenessProbe:
+            tcpSocket:
+              port: metrics
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              # Export workers need headroom; export jobs use the bulkheaded connection pool.
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp

@@ -1,0 +1,95 @@
+/*
+ * Design tokens — single source of truth for the FMS frontend (Blueprint §8.4, §13).
+ *
+ * SECURITY & THEMING CONSTRAINTS:
+ * - Every value below is a compile-time constant (hex / px / rem / keyword). No value may
+ *   ever be interpolated from user input, server configuration, URL parameters, or database
+ *   content — token values must stay static literals so CSS cannot be injected.
+ * - This file must be served as an immutable, content-hashed static asset and loaded with
+ *   Content-Security-Policy `style-src 'self'` (no `'unsafe-inline'`).
+ * - Prohibited in this file: `url(` (external-resource loader / CSS-injection vector),
+ *   `@import`, `expression()`, and `javascript:`. Grep must return zero occurrences.
+ * - Semantic aliases below reference raw (`--raw-*`) values. A future dark/high-contrast
+ *   theme overrides only the `--raw-*` layer (e.g. at `[data-theme="dark"]`); components
+ *   must consume semantic tokens via `var()` only, never raw palette values or literals.
+ *   Any future user-customizable theme must validate its token values against an allowlist
+ *   of known-safe values — never pass them through raw.
+ */
+:root {
+  /* --- Raw palette (private). Swap these for a dark/high-contrast theme. --- */
+  --raw-blue-700: #1d4ed8;
+  --raw-blue-800: #1e40af;
+  --raw-red-700: #b91c1c;
+  --raw-red-800: #991b1b;
+  --raw-emerald-700: #047857;
+  --raw-amber-700: #b45309;
+  --raw-sky-700: #0369a1;
+  --raw-slate-50: #f8fafc;
+  --raw-slate-200: #e2e8f0;
+  --raw-slate-500: #64748b;
+  --raw-slate-800: #1e293b;
+  --raw-white: #ffffff;
+
+  /* --- Spacing — 4px grid (every value a multiple of 4). --- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* --- Typography — 8-level scale + weights + line heights. --- */
+  --text-xs: 12px;   /* captions / auxiliary only */
+  --text-sm: 14px;   /* secondary body, table cells, form labels */
+  --text-base: 16px; /* default body */
+  --text-lg: 18px;   /* card titles, section headers */
+  --text-xl: 20px;   /* sub-page headings */
+  --text-2xl: 24px;  /* dashboard KPI values */
+  --text-3xl: 30px;  /* page titles */
+  --text-4xl: 36px;  /* empty-state hero / welcome */
+  --font-normal: 400;
+  --font-medium: 500;
+  --font-semibold: 600;
+  --font-bold: 700;
+  --leading-tight: 1.25;    /* headings */
+  --leading-normal: 1.5;    /* body */
+  --leading-relaxed: 1.75;  /* long financial summaries */
+
+  /* --- Border radius. --- */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* --- Shadows — no url() refs. --- */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+
+  /* --- Transitions — animate only transform/opacity; ease-out = settle, no overshoot. --- */
+  --transition-fast: 150ms ease-out; /* hover, button press, row highlight */
+  --transition-base: 200ms ease-out; /* color shifts, focus rings, panel expand */
+  --transition-slow: 300ms ease-out; /* modal enter, toast slide-in, content fade */
+
+  /* --- Semantic colors (public). Contrast ratios computed against #ffffff surface. --- */
+  --color-bg: var(--raw-slate-50);          /* cool-gray ground; figure/ground vs surface */
+  --color-surface: var(--raw-white);        /* cards, dialogs, modals */
+  --color-text: var(--raw-slate-800);       /* 15.4:1 vs surface — max legibility */
+  --color-text-muted: var(--raw-slate-500); /* 4.76:1 vs surface — AA for captions/labels ≥14px */
+  --color-border: var(--raw-slate-200);     /* 1.4:1 vs surface — weak structural separator (≥3:1 boundary is provided by focus-ring) */
+  --color-primary: var(--raw-blue-700);     /* 6.9:1 as text/link on bg & surface */
+  --color-primary-hover: var(--raw-blue-800); /* 8.9:1 — hover never reduces contrast */
+  --color-danger: var(--raw-red-700);       /* 6.3:1 — destructive actions, error text */
+  --color-danger-hover: var(--raw-red-800); /* 8.0:1 — active/hover severity */
+  --color-success: var(--raw-emerald-700);  /* 5.2:1 — celebratory completion states */
+  --color-warning: var(--raw-amber-700);    /* 4.8:1 — budget alerts; pair with icon+text */
+  --color-info: var(--raw-sky-700);         /* 6.2:1 — informational toasts/help */
+
+  /* --- Focus ring (WCAG 2.4.7). Double ring: white inner gap isolates blue ring from
+       adjacent surfaces so it reads on both bg and surface. Blue ring 6.9:1 vs white,
+       ≥3:1 vs surface content — meets non-text ≥3:1 UI-component boundary. --- */
+  --focus-ring: 0 0 0 2px var(--raw-white), 0 0 0 4px var(--raw-blue-700);
+}

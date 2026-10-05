@@ -1,0 +1,25 @@
+# ClusterIP Service exposing the stateless FMS SPA pods to the cluster ingress.
+# The web UI is explicitly in scope (Blueprint §6/§7); this Service gives the
+# frontend deployment a stable in-cluster DNS name (fms-frontend.fms.svc.cluster.local)
+# that api-ingress.yaml targets for the `/` path rule. It is ClusterIP-only so the
+# SPA is never directly reachable from outside the cluster (least-privilege
+# networking, tech spec §9.1) — TLS terminates at the ingress; nginx listens on
+# plain HTTP:80 (frontend/nginx.conf, Dockerfile).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fms-frontend
+  namespace: fms
+  labels:
+    app.kubernetes.io/part-of: fms
+    app.kubernetes.io/managed-by: kustomize/gitops
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: fms-frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
